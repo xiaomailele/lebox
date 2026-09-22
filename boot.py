@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# lebox bootstrap · lebox-boot-v4
+# lebox bootstrap · lebox-boot-v5
 # Public, reviewable, standard library only. What it does, in order:
 #   1. If this sandbox can already read the private repository (git with existing GitHub auth), continue with that.
 #   2. Otherwise obtain a user token through GitHub's official Device Flow for the App identified by --client-id.
@@ -10,7 +10,7 @@
 # Nothing is written outside the current directory; the token lives in this process's environment only.
 import argparse, hashlib, json, os, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
-VERSION = 'lebox-boot-v4'
+VERSION = 'lebox-boot-v5'
 UA = 'lebox-agent/1.0'
 
 
@@ -19,8 +19,10 @@ def stop(msg, advice=''):
     sys.exit(2)
 
 
-def http(url, data=None, headers=None):
-    req = urllib.request.Request(url, data=data, method='POST' if data else 'GET', headers={'User-Agent': UA, **(headers or {})})
+def http(url, data=None, headers=None, method=None):
+    if method is None:
+        method = 'POST' if data else 'GET'
+    req = urllib.request.Request(url, data=data, method=method, headers={'User-Agent': UA, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status, r.read(2_000_000)
@@ -35,7 +37,9 @@ def gh_form(path, fields):
     try:
         return json.loads(raw or b'{}')
     except ValueError:
-        stop('GitHub 返回了无法解析的内容（%d）' % st, '稍后重试')
+        # GitHub answers a consumed/unknown device code with an HTML 500 page instead of a JSON error. Treat any non-JSON or
+        # 5xx as "this code is no longer usable" so the caller can fall back to a fresh code instead of stopping.
+        return {'error': 'http_%d' % st, 'error_description': 'GitHub returned non-JSON (HTTP %d)' % st}
 
 
 def api(path, token):
@@ -44,6 +48,15 @@ def api(path, token):
         return st, json.loads(raw or b'{}')
     except ValueError:
         return st, {}
+
+
+def ensure_origin(repo):
+    """Some sandboxes drop .git/config on restore; put origin back so agent.py finds the repository."""
+    if not shutil.which('git') or subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'], capture_output=True, text=True).stdout.strip() != 'true':
+        return
+    if subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True).returncode != 0:
+        subprocess.run(['git', 'remote', 'add', 'origin', 'https://github.com/%s.git' % repo], capture_output=True)
+        print('OK: 已补回 origin（沙盒恢复时 .git/config 被丢弃）', flush=True)
 
 
 def sandbox_can_read(repo):
@@ -81,9 +94,12 @@ def device_flow(client_id, repo, pair):
         if err == 'slow_down':
             interval += 5
             continue
-        if err in ('expired_token', 'incorrect_device_code') and pair:
-            print('OK: 预签发的配对码已失效，改为申请新的设备码', flush=True)
+        if (err in ('expired_token', 'incorrect_device_code') or str(err).startswith('http_')) and pair:
+            print('OK: 预签发的配对码已失效（%s），改为申请新的设备码' % err, flush=True)
             return device_flow(client_id, repo, '')
+        if str(err).startswith('http_5'):
+            print('waiting: GitHub 暂时返回 %s，5 秒后重试' % err, flush=True)
+            continue
         if err == 'access_denied':
             stop('用户在 GitHub 上拒绝了授权', '如需继续，请用户重新运行并在 GitHub 页面点 Authorize')
         if err:
@@ -108,7 +124,8 @@ def check_scope(token, repo, tools):
     extra = sorted({n for n in names if n.lower() not in allowed})
     if extra:
         stop('该授权还覆盖了协作之外的仓库：%s' % ', '.join(extra[:5]), '请用户在 GitHub → Settings → Applications → lebox → Configure 把 Repository access 改为仅 %s 和 %s，然后重新运行' % (repo, tools))
-    print('OK: 授权范围已核对：%s' % '、'.join(sorted({n for n in names if n.lower() in allowed})) , flush=True)
+    seen = sorted({n for n in names if n.lower() in allowed}) or [repo]
+    print('OK: 授权范围已核对：%s' % '、'.join(seen), flush=True)
 
 
 def fetch_recovery_module(tools_repo):
@@ -144,6 +161,34 @@ def recover_token(tools_repo, recovery):
         stop('恢复出的令牌已失效（被撤销或过期）', '请用户重新走一次授权接入（去掉 --recover）')
     print('OK: 已凭对话中的恢复钥匙取回授权，无需再次在 GitHub 授权', flush=True)
     return token
+
+
+def publish_recovery_early(tools_repo, repo, token):
+    """Right after authorization (before join): seal the token with a fresh chat-resident key, put the blob into the public tools
+    repository with this very token (the App is installed there), and print the LEBOX_RECOVERY line. From now on a recycled
+    sandbox can reopen without a second authorization even if join/activate never completes."""
+    fetch_recovery_module(tools_repo)
+    if not os.path.exists('lebox_recovery.py'):
+        print('NOTE: 公开工具仓库里没有 lebox_recovery.py，跳过恢复钥匙（请用户在本地协作端点「发布 / 更新工具」）', flush=True)
+        return ''
+    import importlib.util, base64, secrets
+    spec = importlib.util.spec_from_file_location('lebox_recovery', 'lebox_recovery.py'); lr = importlib.util.module_from_spec(spec); spec.loader.exec_module(lr)
+    rid = secrets.token_hex(16); key = lr.new_key()
+    payload = json.dumps({'v': 1, 'repo': repo, 'tools': tools_repo, 'token': token, 'issued': int(time.time())}).encode()
+    blob = lr.seal(key, payload)
+    body = json.dumps({'message': 'lebox: recovery %s' % rid[:8], 'content': base64.b64encode(blob).decode()}).encode()
+    st, raw = http('https://api.github.com/repos/%s/contents/recovery/%s.bin' % (tools_repo, rid), data=body, method='PUT',
+                   headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'})
+    if st not in (200, 201):
+        print('NOTE: 恢复钥匙密文未能写入公开仓库（HTTP %d）；沙盒回收后需重新授权。若长期如此请用户确认 lebox 应用已安装到 %s。' % (st, tools_repo), flush=True)
+        return ''
+    line = 'LEBOX_RECOVERY=' + lr.format_recovery(rid, key)
+    print('', flush=True)
+    print('RECOVERY（请把下面这一整行原样保留在对话里；沙盒被回收后，重新运行本命令并加上 --recover <那一整串> 即可免授权恢复）：', flush=True)
+    print(line, flush=True)
+    print('', flush=True)
+    os.environ['LEBOX_RECOVERY_DONE'] = '1'
+    return rid
 
 
 def fetch_agent(tools_repo, sha, token):
@@ -183,11 +228,13 @@ def main():
             stop('沙盒没有该仓库的 GitHub 授权，且未提供 --client-id', '请用户在本地协作端重新复制说明')
         token = device_flow(a.client_id, a.repo, a.pair)
         check_scope(token, a.repo, tools)
+        publish_recovery_early(tools, a.repo, token)
     fetch_agent(tools, a.agent_sha, token)
     fetch_recovery_module(tools)
     if a.no_run:
         print('OK: 已下载并校验；按要求未运行 agent.py', flush=True)
         return
+    ensure_origin(a.repo)
     env = dict(os.environ, LEBOX_CLIENT_ID=a.client_id, LEBOX_REPO=a.repo, LEBOX_TOOLS=tools)
     if token:
         env['LEBOX_TOKEN'] = token
