@@ -1,4 +1,4 @@
-# lebox collaboration launcher · lebox-join-v9
+# lebox collaboration launcher · lebox-join-v10
 # Lives in the repository at /.lebox/agent.py (maintained by the lebox desktop). Run from the repository working
 # directory of an Arena conversation:  python .lebox/agent.py join
 # It pushes a join request on the current arena/* branch, waits for the desktop to publish this session's bootstrap,
@@ -6,7 +6,7 @@
 # "STOP:" line meant to be relayed to the user verbatim. No tokens, cookies or keys are requested; only your existing git auth.
 import hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = 'lebox-join-v9'
+VERSION = 'lebox-join-v10'
 JOIN_SUBJECT = 'lebox: join'
 BOOTSTRAP = re.compile(r'\.(lebox|shuncodex-bridge-test)/session-[0-9a-f]{32}/bootstrap\.json')
 WAIT_SECONDS = 900
@@ -298,8 +298,13 @@ def doctor(verbose=True):
             AUTH_SOURCE = 'device-flow'
             install_token_credential(PASTED_TOKEN)
     url = remote_url()
+    if not url and (API_REPO or REPO_HINT):
+        subprocess.run(['git', 'remote', 'add', 'origin', 'https://github.com/%s.git' % (API_REPO or REPO_HINT)], capture_output=True)
+        url = remote_url()
+        if url:
+            print('OK: 已补回 origin（沙盒恢复时 .git/config 被丢弃）', flush=True)
     if not url:
-        stop('仓库没有 origin 远端', '请在 git clone 得到的目录里运行')
+        stop('仓库没有 origin 远端', '请在 git clone 得到的目录里运行，或加 --repo owner/name')
     ok.append('repo ' + re.sub(r'://[^@/]+@', '://', url))
     r = subprocess.run(['git', 'ls-remote', '--heads', 'origin'], capture_output=True, text=True)
     if r.returncode:
@@ -488,8 +493,8 @@ def register_recovery(tools, repo_dir_args):
     (which republishes it to the public tools repo as recovery/<rid>.bin), and print K once for the chat. Only when the token
     came from a device flow / pasted token (sandbox-provided auth needs no recovery)."""
     token = os.environ.get(TOKEN_ENV, '') or PASTED_TOKEN
-    if AUTH_SOURCE not in ('device-flow', 'pasted-token') or not token:
-        return
+    if AUTH_SOURCE not in ('device-flow', 'pasted-token') or not token or os.environ.get('LEBOX_RECOVERY_DONE') == '1':
+        return  # boot.py already published the recovery line right after authorization
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location('lebox_recovery', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lebox_recovery.py'))
