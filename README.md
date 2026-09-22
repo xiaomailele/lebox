@@ -8,6 +8,7 @@ computer, using **a private GitHub repository as the only channel**. No tunnels,
 | File | Purpose |
 |---|---|
 | `boot.py` | Tiny bootstrap (standard library only). Gets GitHub authorization if the sandbox has none, verifies `agent.py` by SHA-256, starts it. |
+| `lebox_recovery.py` | Tiny HMAC-based envelope used for the optional recovery line (see below). |
 | `agent.py` | Launcher: pushes a join request on a dedicated branch, waits for the owner's client to publish the session bundle, verifies it file by file, sets up the encrypted mailbox and starts the collaboration client. |
 
 Both files are published and updated automatically by the owner's local client; their SHA-256 values are printed in every
@@ -27,6 +28,28 @@ set of instructions so a reviewer can verify what will run.
 5. `agent.py` verifies the bundle (every file hashed), unpacks it **outside** the repository, and performs an ECDH key exchange
    with the owner's client. From then on requests and responses are AES-GCM sealed JSON files in the session folder; the
    repository only ever holds ciphertext, the bundle, and the public scripts.
+
+## Recovering after the sandbox is recycled (no second authorization)
+
+Right after pairing, `agent.py` prints one line for the chat:
+
+```
+LEBOX_RECOVERY=lebox1-<session id>-<key>
+```
+
+The key never leaves the chat. `agent.py` uses it to seal the GitHub token it holds (`lebox_recovery.py`, HMAC-based, standard
+library) and hands the opaque blob to the owner's client, which publishes it here as `recovery/<session id>.bin`. Anyone can read
+that file; nobody can open it without the key. When the sandbox is recycled, run
+
+```
+python3 boot.py --repo <owner>/<private-repo> --tools <owner>/lebox --recover "lebox1-…"
+```
+
+`boot.py` fetches the blob, opens it with the key, verifies the token still works and continues straight to `join` — no
+device authorization. The owner can revoke a key at any time from their client ("作废恢复钥匙"), which deletes the blob.
+
+Trade-off, stated plainly: whoever obtains the `LEBOX_RECOVERY` line can recover the same access (read/write ciphertext in the
+two collaboration repositories) until the owner revokes it. Keep the chat private; revoke when a conversation is over.
 
 ## What it does not do
 
