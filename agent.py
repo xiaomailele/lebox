@@ -1,4 +1,4 @@
-# lebox collaboration launcher · lebox-join-v8
+# lebox collaboration launcher · lebox-join-v9
 # Lives in the repository at /.lebox/agent.py (maintained by the lebox desktop). Run from the repository working
 # directory of an Arena conversation:  python .lebox/agent.py join
 # It pushes a join request on the current arena/* branch, waits for the desktop to publish this session's bootstrap,
@@ -6,7 +6,7 @@
 # "STOP:" line meant to be relayed to the user verbatim. No tokens, cookies or keys are requested; only your existing git auth.
 import hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = 'lebox-join-v8'
+VERSION = 'lebox-join-v9'
 JOIN_SUBJECT = 'lebox: join'
 BOOTSTRAP = re.compile(r'\.(lebox|shuncodex-bridge-test)/session-[0-9a-f]{32}/bootstrap\.json')
 WAIT_SECONDS = 900
@@ -482,6 +482,41 @@ def ensure_dependency(tools):
          '请用户检查沙盒是否允许 pip 联网安装；或让 Agent 手动安装 cryptography 后重新运行 join')
 
 
+
+def register_recovery(tools, repo_dir_args):
+    """After pairing: seal this Agent's GitHub token with a fresh random key K, hand the opaque blob to the owner's desktop
+    (which republishes it to the public tools repo as recovery/<rid>.bin), and print K once for the chat. Only when the token
+    came from a device flow / pasted token (sandbox-provided auth needs no recovery)."""
+    token = os.environ.get(TOKEN_ENV, '') or PASTED_TOKEN
+    if AUTH_SOURCE not in ('device-flow', 'pasted-token') or not token:
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('lebox_recovery', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lebox_recovery.py'))
+        if spec is None or not os.path.exists(spec.origin):
+            # boot.py downloads lebox_recovery.py next to agent.py; a bare agent.py run without it just skips recovery.
+            return
+        lr = importlib.util.module_from_spec(spec); spec.loader.exec_module(lr)
+        import secrets as _s, base64 as _b, json as _j
+        rid = _s.token_hex(16); key = lr.new_key()
+        payload = _j.dumps({'v': 1, 'repo': API_REPO or REPO_HINT or '', 'tools': tools_repo_hint(tools), 'token': token, 'issued': int(time.time())}).encode()
+        env = _b.b64encode(lr.seal(key, payload)).decode()
+        r = subprocess.run([PYTHON, str(tools / 'agent_collaboration.py'), 'call', 'lebox_recovery_register', '--arguments', _j.dumps({'rid': rid, 'envelope': env}), '--wait', '60', *repo_dir_args], capture_output=True, text=True)
+        if r.returncode != 0 or '"error"' in r.stdout:
+            print('NOTE: 恢复钥匙未能登记（本机未启用或写入失败）；沙盒回收后需重新授权。', flush=True)
+            return
+        print('', flush=True)
+        print('RECOVERY（请把下面这一整行原样保留在对话里；沙盒被回收后，把它作为 --recover 参数重新运行 boot.py 即可免授权恢复）：', flush=True)
+        print('LEBOX_RECOVERY=' + lr.format_recovery(rid, key), flush=True)
+        print('', flush=True)
+    except Exception as ex:
+        print('NOTE: 恢复钥匙登记跳过：%s' % str(ex)[:120], flush=True)
+
+
+def tools_repo_hint(tools):
+    return os.environ.get('LEBOX_TOOLS', '')
+
+
 def run_agent(tools, *args, timeout=None):
     r = subprocess.run([PYTHON, str(tools / 'agent_collaboration.py'), *args], text=True, timeout=timeout)
     return r.returncode
@@ -570,12 +605,13 @@ def join():
         stop('配对连接失败（见上方输出）', '把上方 stopped/not_confirmed 那行告诉用户')
     print('--- activate (waiting for local confirmation, up to 15 min) ---', flush=True)
     if run_agent(tools, 'activate', '--wait', '900') != 0:
-        stop('激活未完成（见上方输出）', '通常是本机未确认配对；请用户在 本地协作端核对后让 Agent 运行 %s %s/agent_collaboration.py activate --wait 900' % (PYTHON, tools))
+        stop('激活未完成（见上方输出）', '通常是本机未确认配对；请用户在本地协作端核对后让 Agent 运行 %s %s/agent_collaboration.py activate --wait 900' % (PYTHON, tools))
+    register_recovery(tools, [])
     print('READY: 会话已建立（GitHub 授权来源：%s）。接下来（注意用这个解释器：%s）：' % ({'sandbox': '沙盒已有授权', 'device-flow': '用户刚在 GitHub 设备授权页面批准（令牌仅在内存）', 'pasted-token': '说明里的令牌，已放入 git 内存凭据缓存'}.get(AUTH_SOURCE, AUTH_SOURCE), PYTHON), flush=True)
     print('  %s %s/agent_collaboration.py call <工具名> --arguments <JSON>   （默认等 90 秒回包）' % (PYTHON, tools), flush=True)
     print('  结果不明时只运行 status --wait 300，不要重复业务请求；单次 apply_patch 控制在 60 KB 以内。', flush=True)
     print('  按工具返回的指引恢复项目上下文、向用户简报并等待任务。', flush=True)
-    print('  若沙盒被回收（TOOLS_DIR 不存在）或收到 session_closed_by_desktop：直接重新运行 python .lebox/agent.py join，本机会自动重签，无需用户操作。', flush=True)
+    print('  若沙盒被回收或收到 session_closed_by_desktop：用对话里保留的 LEBOX_RECOVERY 重新运行 boot.py --recover <那一串>（免授权）；没有恢复串则重新运行 join。', flush=True)
 
 
 def main():
