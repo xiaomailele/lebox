@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# lebox bootstrap · lebox-boot-v3
+# lebox bootstrap · lebox-boot-v4
 # Public, reviewable, standard library only. What it does, in order:
 #   1. If this sandbox can already read the private repository (git with existing GitHub auth), continue with that.
 #   2. Otherwise obtain a user token through GitHub's official Device Flow for the App identified by --client-id.
@@ -10,7 +10,7 @@
 # Nothing is written outside the current directory; the token lives in this process's environment only.
 import argparse, hashlib, json, os, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
-VERSION = 'lebox-boot-v3'
+VERSION = 'lebox-boot-v4'
 UA = 'lebox-agent/1.0'
 
 
@@ -111,6 +111,41 @@ def check_scope(token, repo, tools):
     print('OK: 授权范围已核对：%s' % '、'.join(sorted({n for n in names if n.lower() in allowed})) , flush=True)
 
 
+def fetch_recovery_module(tools_repo):
+    st, data = http('https://raw.githubusercontent.com/%s/main/lebox_recovery.py' % tools_repo)
+    if st == 200:
+        with open('lebox_recovery.py', 'wb') as f:
+            f.write(data)
+
+
+def recover_token(tools_repo, recovery):
+    """Reopen a session without re-authorizing: fetch the public recovery blob for this rid and open it with the chat-resident key."""
+    fetch_recovery_module(tools_repo)
+    if not os.path.exists('lebox_recovery.py'):
+        stop('公开工具仓库里没有 lebox_recovery.py', '请用户在本地协作端点「发布 / 更新工具」')
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('lebox_recovery', 'lebox_recovery.py'); lr = importlib.util.module_from_spec(spec); spec.loader.exec_module(lr)
+    try:
+        rid, key = lr.parse_recovery(recovery)
+    except ValueError as ex:
+        stop('恢复串格式不对：%s' % ex, '请原样复制对话里 LEBOX_RECOVERY= 后面的整串')
+    st, blob = http('https://raw.githubusercontent.com/%s/main/recovery/%s.bin' % (tools_repo, rid))
+    if st != 200:
+        stop('找不到该会话的恢复密文（recovery/%s.bin，HTTP %d）——可能已被所有者作废' % (rid[:8], st), '请用户重新走一次授权接入（去掉 --recover）')
+    try:
+        payload = json.loads(lr.open_(key, blob))
+    except Exception:
+        stop('恢复密文无法解开（钥匙不匹配或已被替换）', '请用户重新走一次授权接入（去掉 --recover）')
+    token = payload.get('token', '')
+    if not token:
+        stop('恢复密文里没有令牌', '请用户重新走一次授权接入')
+    st, me = api('/repos/' + (payload.get('repo') or ''), token) if payload.get('repo') else (200, {})
+    if st == 401:
+        stop('恢复出的令牌已失效（被撤销或过期）', '请用户重新走一次授权接入（去掉 --recover）')
+    print('OK: 已凭对话中的恢复钥匙取回授权，无需再次在 GitHub 授权', flush=True)
+    return token
+
+
 def fetch_agent(tools_repo, sha, token):
     url = 'https://raw.githubusercontent.com/%s/main/agent.py' % tools_repo
     st, data = http(url)
@@ -132,10 +167,16 @@ def main():
     p.add_argument('--pair', default='', help="one-time pairing code pre-issued by the owner's local client (optional)")
     p.add_argument('--agent-sha', default='', help='expected SHA-256 of agent.py (from the instructions)')
     p.add_argument('--no-run', action='store_true', help='download and verify only; do not start agent.py join')
+    p.add_argument('--recover', default='', help='LEBOX_RECOVERY=lebox1-<rid>-<key> from an earlier session: reopen without re-authorizing')
     a = p.parse_args()
     tools = a.tools or (a.repo.split('/')[0] + '/lebox')
     token = ''
-    if sandbox_can_read(a.repo):
+    if a.recover:
+        token = recover_token(tools, a.recover)
+        global_auth_note = '恢复钥匙'
+    if token:
+        os.environ['LEBOX_AUTH_SOURCE'] = 'device-flow'
+    elif sandbox_can_read(a.repo):
         print('OK: 沙盒已有 GitHub 授权，可读取 %s；不会使用配对码' % a.repo, flush=True)
     else:
         if not a.client_id:
@@ -143,10 +184,11 @@ def main():
         token = device_flow(a.client_id, a.repo, a.pair)
         check_scope(token, a.repo, tools)
     fetch_agent(tools, a.agent_sha, token)
+    fetch_recovery_module(tools)
     if a.no_run:
         print('OK: 已下载并校验；按要求未运行 agent.py', flush=True)
         return
-    env = dict(os.environ, LEBOX_CLIENT_ID=a.client_id, LEBOX_REPO=a.repo)
+    env = dict(os.environ, LEBOX_CLIENT_ID=a.client_id, LEBOX_REPO=a.repo, LEBOX_TOOLS=tools)
     if token:
         env['LEBOX_TOKEN'] = token
     print('--- agent.py join ---', flush=True)
