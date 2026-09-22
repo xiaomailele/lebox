@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+# lebox bootstrap · lebox-boot-v2
+# Public, reviewable, standard library only. What it does, in order:
+#   1. If this sandbox can already read the private repository (git with existing GitHub auth), continue with that.
+#   2. Otherwise obtain a user token through GitHub's official Device Flow for the App identified by --client-id.
+#      With --pair the device code was pre-issued by the repository owner's local client and approved by the owner on
+#      github.com/login/device, so nothing has to be relayed; without --pair this script prints a code for the user to enter.
+#   3. Check that the token sees nothing beyond the collaboration repository and the public tools repository; stop otherwise.
+#   4. Download agent.py from the public tools repository, verify its SHA-256 against --agent-sha, then run  agent.py join .
+# Nothing is written outside the current directory; the token lives in this process's environment only.
+import argparse, hashlib, json, os, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+
+VERSION = 'lebox-boot-v2'
+UA = 'lebox-agent/1.0'
+
+
+def stop(msg, advice=''):
+    print('STOP: ' + msg + (' | ' + advice if advice else ''), flush=True)
+    sys.exit(2)
+
+
+def http(url, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, method='POST' if data else 'GET', headers={'User-Agent': UA, **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read(2_000_000)
+    except urllib.error.HTTPError as ex:
+        return ex.code, ex.read(200_000)
+    except (urllib.error.URLError, TimeoutError, OSError) as ex:
+        stop('无法访问 %s：%s' % (urllib.parse.urlsplit(url).netloc, str(ex)[:100]), '请用户检查沙盒网络')
+
+
+def gh_form(path, fields):
+    st, raw = http('https://github.com' + path, data=urllib.parse.urlencode(fields).encode(), headers={'Accept': 'application/json'})
+    try:
+        return json.loads(raw or b'{}')
+    except ValueError:
+        stop('GitHub 返回了无法解析的内容（%d）' % st, '稍后重试')
+
+
+def api(path, token):
+    st, raw = http('https://api.github.com' + path, headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+    try:
+        return st, json.loads(raw or b'{}')
+    except ValueError:
+        return st, {}
+
+
+def sandbox_can_read(repo):
+    if not shutil.which('git'):
+        return False
+    r = subprocess.run(['git', 'ls-remote', '--heads', 'https://github.com/%s.git' % repo], capture_output=True, env=dict(os.environ, GIT_TERMINAL_PROMPT='0'))
+    return r.returncode == 0
+
+
+def device_flow(client_id, repo, pair):
+    if pair:
+        code, interval, expires = pair, 5, 900
+        print('OK: 使用仓库所有者本地协作端预签发的一次性配对码；等待所有者在 GitHub 页面点 Authorize（无需转告任何代码）', flush=True)
+    else:
+        s = gh_form('/login/device/code', {'client_id': client_id})
+        if s.get('verification_uri') != 'https://github.com/login/device' or not s.get('device_code'):
+            stop('GitHub 未返回设备授权信息：%s' % (s.get('error_description') or s.get('error') or s), '请用户确认 lebox 应用已启用 Device Flow')
+        code, interval, expires = s['device_code'], int(s.get('interval', 5)), int(s.get('expires_in', 900))
+        print('', flush=True)
+        print('ACTION REQUIRED（请把下面两行原样转告用户）：', flush=True)
+        print('  请在浏览器打开 https://github.com/login/device ，输入一次性代码  %s  ，然后点 Authorize。' % s['user_code'], flush=True)
+        print('  授权对象是 lebox 应用（应仅安装在仓库 %s 上）；%d 分钟内有效，我在这里等待。' % (repo, expires // 60), flush=True)
+        print('', flush=True)
+    deadline = time.time() + expires
+    while time.time() < deadline:
+        time.sleep(interval)
+        r = gh_form('/login/oauth/access_token', {'client_id': client_id, 'device_code': code, 'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'})
+        err = r.get('error')
+        if err == 'authorization_pending':
+            continue
+        if err == 'slow_down':
+            interval += 5
+            continue
+        if err in ('expired_token', 'incorrect_device_code') and pair:
+            print('OK: 预签发的配对码已失效，改为申请新的设备码', flush=True)
+            return device_flow(client_id, repo, '')
+        if err == 'access_denied':
+            stop('用户在 GitHub 上拒绝了授权', '如需继续，请用户重新运行并在 GitHub 页面点 Authorize')
+        if err:
+            stop('GitHub 授权未完成：%s' % (r.get('error_description') or err), '把这行原样告诉用户')
+        if r.get('access_token') and str(r.get('token_type', '')).lower() == 'bearer':
+            return r['access_token']
+    stop('等待用户在 GitHub 授权超时', '重新运行会生成新的代码')
+
+
+def check_scope(token, repo, tools):
+    """The token must see the collaboration repository; besides it only the public tools repository is acceptable."""
+    st, me = api('/repos/' + repo, token)
+    if st != 200:
+        stop('授权已完成，但该授权看不到仓库 %s（HTTP %d）' % (repo, st), '请用户确认 lebox 应用已安装到这个仓库（GitHub → Settings → Applications → lebox → Configure）')
+    st, inst = api('/user/installations?per_page=20', token)
+    names = []
+    for i in (inst.get('installations') or []) if st == 200 else []:
+        st2, page = api('/user/installations/%s/repositories?per_page=100' % i.get('id'), token)
+        if st2 == 200:
+            names += [r.get('full_name', '') for r in page.get('repositories') or []]
+    allowed = {repo.lower(), tools.lower()}
+    extra = sorted({n for n in names if n.lower() not in allowed})
+    if extra:
+        stop('该授权还覆盖了协作之外的仓库：%s' % ', '.join(extra[:5]), '请用户在 GitHub → Settings → Applications → lebox → Configure 把 Repository access 改为仅 %s 和 %s，然后重新运行' % (repo, tools))
+    print('OK: 授权范围已核对：%s' % '、'.join(sorted({n for n in names if n.lower() in allowed})) , flush=True)
+
+
+def fetch_agent(tools_repo, sha, token):
+    url = 'https://raw.githubusercontent.com/%s/main/agent.py' % tools_repo
+    st, data = http(url)
+    if st != 200:
+        stop('无法从公开工具仓库下载 agent.py（%d）' % st, '请用户确认公开仓库 %s 存在且包含 agent.py' % tools_repo)
+    digest = hashlib.sha256(data).hexdigest()
+    if sha and digest != sha.lower():
+        stop('agent.py 的 SHA-256 (%s…) 与说明中的不一致，已停止' % digest[:16], '请用户在本地协作端重新复制说明')
+    with open('agent.py', 'wb') as f:
+        f.write(data)
+    print('OK: agent.py 已下载并通过 SHA-256 校验（%s…）' % digest[:16], flush=True)
+
+
+def main():
+    p = argparse.ArgumentParser(description='lebox bootstrap: authorize (if needed), verify and start agent.py join')
+    p.add_argument('--repo', required=True, help='private collaboration repository owner/name')
+    p.add_argument('--tools', default='', help='public tools repository owner/name (default: <owner>/lebox)')
+    p.add_argument('--client-id', default='', help='GitHub App public client id (needed only when the sandbox has no GitHub access)')
+    p.add_argument('--pair', default='', help="one-time pairing code pre-issued by the owner's local client (optional)")
+    p.add_argument('--agent-sha', default='', help='expected SHA-256 of agent.py (from the instructions)')
+    p.add_argument('--no-run', action='store_true', help='download and verify only; do not start agent.py join')
+    a = p.parse_args()
+    tools = a.tools or (a.repo.split('/')[0] + '/lebox')
+    token = ''
+    if sandbox_can_read(a.repo):
+        print('OK: 沙盒已有 GitHub 授权，可读取 %s；不会使用配对码' % a.repo, flush=True)
+    else:
+        if not a.client_id:
+            stop('沙盒没有该仓库的 GitHub 授权，且未提供 --client-id', '请用户在本地协作端重新复制说明')
+        token = device_flow(a.client_id, a.repo, a.pair)
+        check_scope(token, a.repo, tools)
+    fetch_agent(tools, a.agent_sha, token)
+    if a.no_run:
+        print('OK: 已下载并校验；按要求未运行 agent.py', flush=True)
+        return
+    env = dict(os.environ, LEBOX_CLIENT_ID=a.client_id, LEBOX_REPO=a.repo)
+    if token:
+        env['LEBOX_TOKEN'] = token
+    print('--- agent.py join ---', flush=True)
+    sys.exit(subprocess.run([sys.executable, 'agent.py', 'join', '--repo', a.repo], env=env).returncode)
+
+
+if __name__ == '__main__':
+    main()
