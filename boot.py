@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# lebox bootstrap · lebox-boot-v2
+# lebox bootstrap · lebox-boot-v3
 # Public, reviewable, standard library only. What it does, in order:
 #   1. If this sandbox can already read the private repository (git with existing GitHub auth), continue with that.
 #   2. Otherwise obtain a user token through GitHub's official Device Flow for the App identified by --client-id.
@@ -10,7 +10,7 @@
 # Nothing is written outside the current directory; the token lives in this process's environment only.
 import argparse, hashlib, json, os, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
-VERSION = 'lebox-boot-v2'
+VERSION = 'lebox-boot-v3'
 UA = 'lebox-agent/1.0'
 
 
@@ -68,11 +68,15 @@ def device_flow(client_id, repo, pair):
         print('  授权对象是 lebox 应用（应仅安装在仓库 %s 上）；%d 分钟内有效，我在这里等待。' % (repo, expires // 60), flush=True)
         print('', flush=True)
     deadline = time.time() + expires
+    last_note = time.time()
     while time.time() < deadline:
         time.sleep(interval)
         r = gh_form('/login/oauth/access_token', {'client_id': client_id, 'device_code': code, 'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'})
         err = r.get('error')
         if err == 'authorization_pending':
+            if time.time() - last_note >= 30:
+                last_note = time.time()
+                print('waiting for owner approval on github.com/login/device ... (%d 分钟后过期)' % max(1, int((deadline - time.time()) // 60)), flush=True)
             continue
         if err == 'slow_down':
             interval += 5
