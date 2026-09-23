@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# lebox bootstrap · lebox-boot-v5
+# lebox bootstrap · lebox-boot-v6
 # Public, reviewable, standard library only. What it does, in order:
 #   1. If this sandbox can already read the private repository (git with existing GitHub auth), continue with that.
 #   2. Otherwise obtain a user token through GitHub's official Device Flow for the App identified by --client-id.
@@ -10,7 +10,7 @@
 # Nothing is written outside the current directory; the token lives in this process's environment only.
 import argparse, hashlib, json, os, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 
-VERSION = 'lebox-boot-v5'
+VERSION = 'lebox-boot-v6'
 UA = 'lebox-agent/1.0'
 
 
@@ -160,6 +160,7 @@ def recover_token(tools_repo, recovery):
     if st == 401:
         stop('恢复出的令牌已失效（被撤销或过期）', '请用户重新走一次授权接入（去掉 --recover）')
     print('OK: 已凭对话中的恢复钥匙取回授权，无需再次在 GitHub 授权', flush=True)
+    os.environ['LEBOX_RECOVERY_SELF'] = recovery.strip().replace('LEBOX_RECOVERY=', '')
     return token
 
 
@@ -188,6 +189,7 @@ def publish_recovery_early(tools_repo, repo, token):
     print(line, flush=True)
     print('', flush=True)
     os.environ['LEBOX_RECOVERY_DONE'] = '1'
+    os.environ['LEBOX_RECOVERY_SELF'] = line[len('LEBOX_RECOVERY='):]  # lets agent.py re-seal the blob when the desktop renews the token
     return rid
 
 
