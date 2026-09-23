@@ -1,4 +1,4 @@
-# lebox collaboration launcher · lebox-join-v10
+# lebox collaboration launcher · lebox-join-v11
 # Lives in the repository at /.lebox/agent.py (maintained by the lebox desktop). Run from the repository working
 # directory of an Arena conversation:  python .lebox/agent.py join
 # It pushes a join request on the current arena/* branch, waits for the desktop to publish this session's bootstrap,
@@ -6,7 +6,7 @@
 # "STOP:" line meant to be relayed to the user verbatim. No tokens, cookies or keys are requested; only your existing git auth.
 import hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = 'lebox-join-v10'
+VERSION = 'lebox-join-v11'
 JOIN_SUBJECT = 'lebox: join'
 BOOTSTRAP = re.compile(r'\.(lebox|shuncodex-bridge-test)/session-[0-9a-f]{32}/bootstrap\.json')
 WAIT_SECONDS = 900
@@ -619,7 +619,25 @@ def join():
     print('  若沙盒被回收或收到 session_closed_by_desktop：用对话里保留的 LEBOX_RECOVERY 重新运行 boot.py --recover <那一串>（免授权）；没有恢复串则重新运行 join。', flush=True)
 
 
+def self_check():
+    """When agent.py.sha256 sits next to this file (in-repo copy published by the owner's client), refuse to run if the
+    file was altered. Lets the one-line instructions omit the hash without giving up integrity."""
+    here = os.path.abspath(__file__)
+    side = here + '.sha256'
+    if not os.path.exists(side):
+        return
+    try:
+        want = open(side).read().split()[0].strip().lower()
+        have = hashlib.sha256(open(here, 'rb').read()).hexdigest()
+    except Exception:
+        return
+    if want != have:
+        stop('agent.py 与同目录 agent.py.sha256 不一致（文件被修改或未完整更新）', '请用户在本地协作端点「连接 Agent」重新同步脚本；不要运行被改动的副本')
+    print('OK: agent.py 自校验通过 (sha256=%s…)' % have[:16], flush=True)
+
+
 def main():
+    self_check()
     global BRANCH_OVERRIDE
     args = sys.argv[1:]
     global API_REPO, REPO_HINT, CLIENT_ID, DEVICE_CODE
