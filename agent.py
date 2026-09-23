@@ -1,12 +1,12 @@
-# lebox collaboration launcher · lebox-join-v11
+# lebox collaboration launcher · lebox-join-v12
 # Lives in the repository at /.lebox/agent.py (maintained by the lebox desktop). Run from the repository working
 # directory of an Arena conversation:  python .lebox/agent.py join
 # It pushes a join request on the current arena/* branch, waits for the desktop to publish this session's bootstrap,
 # verifies and unpacks it outside the repository, installs the one dependency, pairs and activates. Every failure prints one
 # "STOP:" line meant to be relayed to the user verbatim. No tokens, cookies or keys are requested; only your existing git auth.
-import hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
+import hashlib, json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile, time
 
-VERSION = 'lebox-join-v11'
+VERSION = 'lebox-join-v12'
 JOIN_SUBJECT = 'lebox: join'
 BOOTSTRAP = re.compile(r'\.(lebox|shuncodex-bridge-test)/session-[0-9a-f]{32}/bootstrap\.json')
 WAIT_SECONDS = 900
@@ -571,6 +571,36 @@ def api_unpack(branch, tip, path):
     return out
 
 
+def remote_client_argv(tools, *args):
+    # --repo is a global argparse option: it must precede list/call/status.
+    # This identifies the LOCAL transport worktree, never the desktop project.
+    return [PYTHON, str(tools / 'agent_collaboration.py'), '--repo', os.getcwd(), *args]
+
+
+def print_remote_handoff(tools, api_mode=False):
+    """Print actionable next steps only; never claim an unperformed remote read succeeded."""
+    prefix = 'LEBOX_TRANSPORT=api ' if api_mode else ''
+    def command(*args):
+        return prefix + shlex.join(remote_client_argv(tools, *args))
+    print('NEXT_REQUIRED: 会话建立，远端确认未完成。不要在 READY 处结束任务。', flush=True)
+    print('LEBOX_CLIENT=' + json.dumps({'python': PYTHON, 'script': str(tools / 'agent_collaboration.py'),
+          'local_transport_repository': os.getcwd(), 'transport': 'api' if api_mode else 'git',
+          'remote_project_verified': False}, ensure_ascii=False), flush=True)
+    print('以下示例适用于 POSIX shell；其他 shell 请保持参数顺序并按该 shell 引用路径。', flush=True)
+    if api_mode:
+        print('API 模式需保留已有授权环境变量 %s；不要打印或粘贴令牌。' % TOKEN_ENV, flush=True)
+    print('1. 获取远端工具清单（不是列出本地文件）：', flush=True)
+    print('  ' + command('list'), flush=True)
+    print('2. 按初始化返回的项目指引恢复上下文；仅当清单包含 workspace_status 且 schema 支持 detail 时运行：', flush=True)
+    print('  ' + command('call', 'workspace_status', '--arguments', '{"detail":"lite"}'), flush=True)
+    print('检查远端回包中的项目名称和真实路径并确认目标一致，才报告“远端项目已确认”。工具缺失/权限失败就报告，不猜工具名。', flush=True)
+    print('3. 用户的项目目录、文件和命令操作默认走清单中的远端工具；本地 Bash 仅启动此客户端。', flush=True)
+    print('本地 pwd/ls/git ls-files 只反映 Agent 沙盒，不是 桌面端的远端项目；不得静默回退或冒充远端结果。用户明确要求本地操作时须标注“本地沙盒”。', flush=True)
+    print('工具结果不明时只继续等待，不重复业务请求、不因普通工具错误重复 join：', flush=True)
+    print('  ' + command('status', '--wait', '300'), flush=True)
+    print('单次 apply_patch 控制在 60 KB 以内；目录工具的名称、参数和授权要求以真实清单及服务端指引为准。', flush=True)
+
+
 def join():
     branch = doctor(verbose=True)
     if API_MODE:
@@ -585,15 +615,14 @@ def join():
             os.environ['LEBOX_AUTH_SOURCE'] = 'pasted-token'
         ensure_dependency(tools)
         print('--- connect ---', flush=True)
-        if run_agent(tools, 'connect', '--repo', os.getcwd()) != 0:
+        if run_agent(tools, '--repo', os.getcwd(), 'connect') != 0:
             stop('配对连接失败（见上方输出）', '把上方 stopped/not_confirmed 那行告诉用户')
         print('--- activate (waiting for local confirmation, up to 15 min) ---', flush=True)
-        if run_agent(tools, 'activate', '--wait', '900', '--repo', os.getcwd()) != 0:
-            stop('激活未完成（见上方输出）', '请用户在 本地协作端核对后让 Agent 运行 %s %s/agent_collaboration.py activate --wait 900 --repo %s' % (PYTHON, tools, os.getcwd()))
+        if run_agent(tools, '--repo', os.getcwd(), 'activate', '--wait', '900') != 0:
+            stop('激活未完成（见上方输出）', '请用户在 本地协作端核对后按会话客户端指引检查状态；不要重复业务请求')
         os.environ[TOKEN_ENV] = API_TOKEN  # child processes (agent_collaboration.py) read it from here; never written to disk
         print('READY: 会话已建立（API 模式，GitHub 授权来源：%s；后续调用需保持环境变量 %s）。接下来：' % ({'sandbox': '沙盒环境变量', 'device-flow': '用户刚在 GitHub 设备授权页面批准', 'pasted-token': '说明里的令牌'}.get(AUTH_SOURCE, AUTH_SOURCE), TOKEN_ENV), flush=True)
-        print('  LEBOX_TRANSPORT=api %s=<令牌> %s %s/agent_collaboration.py call <工具名> --arguments <JSON> --repo %s' % (TOKEN_ENV, PYTHON, tools, os.getcwd()), flush=True)
-        print('  结果不明时只运行 status --wait 300，不要重复业务请求；单次 apply_patch 控制在 60 KB 以内。', flush=True)
+        print_remote_handoff(tools, api_mode=True)
         print('  若沙盒被回收或收到 session_closed_by_desktop：重新运行 join（同样参数）。', flush=True)
         return
     remote_exists = fetch_branch(branch, missing_ok=True)
@@ -613,9 +642,7 @@ def join():
         stop('激活未完成（见上方输出）', '通常是本机未确认配对；请用户在本地协作端核对后让 Agent 运行 %s %s/agent_collaboration.py activate --wait 900' % (PYTHON, tools))
     register_recovery(tools, [])
     print('READY: 会话已建立（GitHub 授权来源：%s）。接下来（注意用这个解释器：%s）：' % ({'sandbox': '沙盒已有授权', 'device-flow': '用户刚在 GitHub 设备授权页面批准（令牌仅在内存）', 'pasted-token': '说明里的令牌，已放入 git 内存凭据缓存'}.get(AUTH_SOURCE, AUTH_SOURCE), PYTHON), flush=True)
-    print('  %s %s/agent_collaboration.py call <工具名> --arguments <JSON>   （默认等 90 秒回包）' % (PYTHON, tools), flush=True)
-    print('  结果不明时只运行 status --wait 300，不要重复业务请求；单次 apply_patch 控制在 60 KB 以内。', flush=True)
-    print('  按工具返回的指引恢复项目上下文、向用户简报并等待任务。', flush=True)
+    print_remote_handoff(tools)
     print('  若沙盒被回收或收到 session_closed_by_desktop：用对话里保留的 LEBOX_RECOVERY 重新运行 boot.py --recover <那一串>（免授权）；没有恢复串则重新运行 join。', flush=True)
 
 
