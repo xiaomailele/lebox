@@ -1,4 +1,4 @@
-# lebox collaboration launcher · lebox-join-v12
+# lebox collaboration launcher · lebox-join-v13
 # Lives in the repository at /.lebox/agent.py (maintained by the lebox desktop). Run from the repository working
 # directory of an Arena conversation:  python .lebox/agent.py join
 # It pushes a join request on the current arena/* branch, waits for the desktop to publish this session's bootstrap,
@@ -6,7 +6,7 @@
 # "STOP:" line meant to be relayed to the user verbatim. No tokens, cookies or keys are requested; only your existing git auth.
 import hashlib, json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile, time
 
-VERSION = 'lebox-join-v12'
+VERSION = 'lebox-join-v14'
 JOIN_SUBJECT = 'lebox: join'
 BOOTSTRAP = re.compile(r'\.(lebox|shuncodex-bridge-test)/session-[0-9a-f]{32}/bootstrap\.json')
 WAIT_SECONDS = 900
@@ -243,6 +243,217 @@ def ensure_repo_checkout(repo):
     return pathlib.Path(name).resolve()
 
 
+PROJECT_ID = ""
+
+def demand_repository(config):
+    if PROJECT_ID and config.get("project_id") != PROJECT_ID:
+        stop("会话属于另一项目，不能恢复到当前项目", "请使用当前项目的独立会话分支，未转移身份或重放操作")
+    if API_MODE:
+        target = API_REPO
+    else:
+        url = remote_url()
+        if url.startswith('git@github.com:'):
+            target = url[len('git@github.com:'):]
+        else:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(url)
+            if parsed.scheme != 'https' or parsed.hostname != 'github.com' or parsed.port not in (None, 443) or parsed.query or parsed.fragment:
+                stop('origin 不是已授权的 GitHub 仓库地址', '未恢复或创建任何 Agent 身份')
+            target = parsed.path.lstrip('/')
+        target = target.removesuffix('.git')
+    if not isinstance(config.get('repository'), str) or config['repository'].lower() != target.lower():
+        stop('会话资料属于另一仓库，不能自动匹配', '保留原状态，检查当前项目仓库；未转移身份或权限')
+
+
+def legacy_project_branch(repo, scope):
+    """Migrate only this sandbox/recovery route when original private state proves the same project."""
+    if not PROJECT_ID:
+        return None
+    temp = pathlib.Path(tempfile.gettempdir())
+    old = temp / ('lebox-route-' + hashlib.sha256(scope.encode()).hexdigest())
+    marker = old / 'branch'
+    if not marker.exists():
+        return None
+    if old.is_symlink() or marker.is_symlink() or old.resolve().is_relative_to(pathlib.Path.cwd().resolve()):
+        stop('旧自动分支缓存位置不安全', '保留原资料并核对')
+    branch = marker.read_text().strip()
+    if not re.fullmatch(r'agent/[0-9a-f]{32}', branch):
+        stop('旧自动分支缓存损坏', '不能自动替换原会话')
+    matches = set()
+    for file in temp.glob('lebox-tools-*/connection.json'):
+        if file.is_symlink() or file.parent.is_symlink() or file.stat().st_size > 1_200_000:
+            continue
+        try:
+            config = json.loads(file.read_bytes(), object_pairs_hook=unique)
+            if config.get('project_id') != PROJECT_ID or config.get('repository', '').lower() != repo.lower() or config.get('branch') != branch:
+                continue
+            binding = config.get('binding', '')
+            if not re.fullmatch(r'[0-9a-f]{32}', binding):
+                raise ValueError()
+            private = temp / ('scx-collaboration-' + binding)
+            state_file = private / 'state.json'
+            if private.is_symlink() or state_file.is_symlink() or not state_file.exists() or state_file.stat().st_size > 1_200_000:
+                stop('找到旧项目会话，但原私有状态不可用', '先恢复原状态，或在桌面明确处理旧会话；未创建替代身份')
+            state = json.loads(state_file.read_bytes(), object_pairs_hook=unique)
+            digest = hashlib.sha256(json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+            if state.get('config_hash') != digest or not state.get('keys') or not state.get('hello'):
+                raise ValueError()
+            if state.get('closed'):
+                if state.get('pending'):
+                    stop('原操作结果仍未确认', '保留原状态，只查询原结果')
+                continue
+            matches.add(binding)
+        except (OSError, ValueError, KeyError, TypeError):
+            stop('旧项目会话资料不完整', '保留原资料，不自动替换身份')
+    if len(matches) > 1:
+        stop('旧分支存在多个项目会话', '需要核对原身份，不按时间猜选')
+    return branch if matches else None
+
+
+def automatic_branch(repo):
+    """Remember a transport branch, never credentials or an authenticated session identity."""
+    import secrets
+    scope = repo.lower() + '\n' + str(pathlib.Path.cwd().resolve()) + '\n' + os.environ.get('LEBOX_RECOVERY_SELF', '')
+    legacy_scope = scope
+    if PROJECT_ID:
+        scope += '\nproject=' + PROJECT_ID
+    key = hashlib.sha256(scope.encode()).hexdigest()
+    root = pathlib.Path(tempfile.gettempdir()) / ('lebox-route-' + key)
+    if root.is_symlink() or root.resolve().is_relative_to(pathlib.Path.cwd().resolve()):
+        stop('自动分支缓存路径不安全', '请检查临时目录，不要删除原会话资料')
+    root.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(root, 0o700)
+    marker = root / 'branch'
+    if marker.is_symlink():
+        stop('自动分支缓存不可用', '请检查临时目录')
+    preferred = legacy_project_branch(repo, legacy_scope) if not marker.exists() else None
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        branch = marker.read_text().strip()
+        if not re.fullmatch(r'agent/[0-9a-f]{32}', branch):
+            stop('自动分支缓存损坏', '保留原状态并核对，不自动创建替代会话')
+        return branch
+    with os.fdopen(fd, 'w') as file:
+        branch = preferred or 'agent/' + secrets.token_hex(16)
+        file.write(branch); file.flush(); os.fsync(file.fileno())
+    return branch
+
+
+def local_resume_candidate(branch, paths, read_raw):
+    """Select only by an exact descriptor hash plus private cryptographic state, not branch name."""
+    matches = []
+    for path in paths:
+        if not BOOTSTRAP.fullmatch(path):
+            continue
+        binding = path.split('/session-', 1)[1].split('/')[0]
+        root = pathlib.Path(tempfile.gettempdir()) / ('scx-collaboration-' + binding)
+        state_file = root / 'state.json'
+        if not state_file.exists():
+            continue
+        if root.is_symlink() or state_file.is_symlink() or root.resolve().is_relative_to(pathlib.Path.cwd().resolve()):
+            stop('旧会话私有状态位置不安全', '保留原状态，未发出新的接入请求')
+        try:
+            raw = read_raw(path)
+            if len(raw) > 1_200_000 or state_file.stat().st_size > 1_200_000:
+                raise ValueError()
+            bundle = json.loads(raw, object_pairs_hook=unique)
+            entry = bundle['files']['connection.json']
+            content = entry['content'].encode('utf-8')
+            if hashlib.sha256(content).hexdigest() != entry['sha256']:
+                raise ValueError()
+            config = json.loads(content, object_pairs_hook=unique)
+            state = json.loads(state_file.read_bytes(), object_pairs_hook=unique)
+            digest = hashlib.sha256(json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+            if config.get('branch') != branch:
+                continue
+            demand_repository(config)
+            if config.get('binding') != binding or state.get('config_hash') != digest:
+                raise ValueError()
+            if state.get('closed'):
+                if state.get('pending'):
+                    stop('旧会话已关闭但原操作仍未确认', '只检查原请求，不新建会话或重新执行')
+                continue
+            if not state.get('keys') or not state.get('hello'):
+                stop('旧会话配对尚未完整', '保留原状态，使用原会话客户端继续核对，不重新配对')
+            matches.append((path, state))
+        except (OSError, ValueError, KeyError, TypeError):
+            stop('旧会话状态或描述不匹配', '保留原资料，未发出新的接入请求')
+    if len(matches) > 1:
+        stop('发现多个可恢复会话，不能自动选择身份', '使用该 Agent 原工具目录中的客户端查询状态')
+    return matches[0] if matches else None
+
+
+def preissued_bootstrap(branch, paths, read_raw, exists):
+    """Only an unclaimed, unclosed offer can start a new identity. Never reuse an active peer."""
+    offers, active = [], []
+    for path in paths:
+        try:
+            raw = read_raw(path)
+            if len(raw) > 1_200_000:
+                raise ValueError()
+            bundle = json.loads(raw, object_pairs_hook=unique)
+            entry = bundle['files']['connection.json']
+            content = entry['content'].encode()
+            if hashlib.sha256(content).hexdigest() != entry['sha256']:
+                raise ValueError()
+            config = json.loads(content, object_pairs_hook=unique)
+            if config.get('branch') != branch:
+                continue
+            demand_repository(config)
+            if not re.fullmatch(r'[0-9a-f]{32}', config.get('binding', '')) or not path.endswith('/session-' + config['binding'] + '/bootstrap.json'):
+                raise ValueError()
+            directory = path.rsplit('/', 1)[0]
+            if exists(directory + '/server.closed.json'):
+                continue
+            if exists(directory + '/client.hello.json'):
+                active.append(path)
+            else:
+                offers.append(path)
+        except (ValueError, TypeError, KeyError):
+            stop('接入资料无法验证', '未创建新身份，也未停止其他 Agent')
+    if len(offers) > 1:
+        stop('此分支存在多个未认领会话，无法唯一匹配', '请在桌面端核对目标会话，不自动猜测身份')
+    if offers:
+        return offers[0]
+    if active:
+        stop('此分支已有 Agent，但本沙盒缺少它的原会话私有状态', '不要等待批准或删除 pending；用原状态恢复，或在桌面端明确替换选中的 Agent，其他 Agent 不受影响')
+    return None
+
+
+def api_file_exists(tip, path):
+    status, _ = api('GET', '/repos/%s/contents/%s?ref=%s' % (API_REPO, quote(path), tip), allow=(404,))
+    return status == 200
+
+
+def git_file_exists(path):
+    result = subprocess.run(['git', 'ls-tree', '-z', 'FETCH_HEAD', '--', path], capture_output=True)
+    if result.returncode != 0:
+        stop('无法核对原会话文件', '不创建新身份，请检查仓库状态')
+    return bool(result.stdout)
+
+
+def resume_existing(branch, paths, tip=None):
+    read_raw = (lambda p: api_blob(tip, p)) if API_MODE else (lambda p: git('show', 'FETCH_HEAD:' + p, text=False))
+    match = local_resume_candidate(branch, paths, read_raw)
+    if match is None:
+        return False
+    path, state = match
+    tools = api_unpack(branch, tip, path) if API_MODE else unpack(branch, path)
+    if API_MODE:
+        os.environ['LEBOX_TRANSPORT'] = 'api'
+        os.environ[TOKEN_ENV] = API_TOKEN
+    if AUTH_SOURCE in ('pasted-token', 'device-flow'):
+        os.environ['LEBOX_AUTH_SOURCE'] = 'pasted-token'
+    ensure_dependency(tools)
+    print('RESUMING: 使用原会话身份；不推送新接入请求，不重发业务操作。', flush=True)
+    command = ['status', '--wait', '0'] if state.get('pending') or state.get('initialized') else ['activate', '--wait', '900']
+    if run_agent(tools, '--repo', os.getcwd(), *command) != 0:
+        stop('原会话尚未恢复（见上方状态）', '保留原状态，不重发或重新配对')
+    print_remote_handoff(tools, api_mode=API_MODE)
+    return True
+
+
 def doctor(verbose=True):
     global API_MODE, API_TOKEN, API_REPO, AUTH_SOURCE, PASTED_TOKEN
     ok = []
@@ -270,8 +481,7 @@ def doctor(verbose=True):
         ok.append('repo ' + API_REPO + ' 可读（令牌有效）')
         branch = BRANCH_OVERRIDE
         if not branch or branch == 'agent/auto':
-            import secrets as _secrets
-            branch = 'agent/' + _secrets.token_hex(4)
+            branch = automatic_branch(API_REPO)
         if branch.lower() in ('main', 'master') or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}', branch) or '..' in branch:
             stop('分支 %r 不能用作会话分支' % branch, '换一个不是 main/master 的专用分支名')
         ok.append('branch ' + branch + '（自定义专用分支）')
@@ -318,8 +528,7 @@ def doctor(verbose=True):
     branch = BRANCH_OVERRIDE or git('symbolic-ref', '--short', '-q', 'HEAD', check=False).strip()
     if BRANCH_OVERRIDE == 'agent/auto' or (not BRANCH_OVERRIDE and (not branch or branch.lower() in ('main', 'master')) and AUTH_SOURCE == 'pasted-token'):
         # Platforms without a conversation branch: mint a unique one. Arena keeps its own arena/* branch untouched.
-        import secrets as _secrets
-        branch = 'agent/' + _secrets.token_hex(4)
+        branch = branch if branch.startswith('agent/') and branch != 'agent/auto' else automatic_branch(url)
         r = subprocess.run(['git', 'checkout', '-q', '-B', branch], capture_output=True, text=True)
         if r.returncode:
             stop('无法创建分支 %s：%s' % (branch, r.stderr.strip()[:160]), '请先提交或暂存本地改动')
@@ -405,7 +614,7 @@ def wait_bootstrap(branch, ignore, since):
         if waited - last_hint >= 180:
             hint = '  ← 若本机没有反应：请用户在本地协作端 点 GitHub 徽章 →「连接 Agent」'
             last_hint = waited
-        print('waiting for desktop confirmation... %ds%s' % (waited, hint), flush=True)
+        print('waiting for desktop session bootstrap... %ds%s' % (waited, hint), flush=True)
         time.sleep(delay)
         delay = min(delay + 2, 15)
     stop('15 分钟内用户本地的协作端 没有发布接入资料', '请用户在电脑端 lebox 点 GitHub 徽章 →「连接 Agent」，然后让 Agent 重新运行 join')
@@ -439,6 +648,7 @@ def unpack(branch, path):
     c = json.loads((out / 'connection.json').read_bytes())
     if c.get('branch') != branch or not path.endswith('/session-%s/bootstrap.json' % c.get('binding')):
         stop('引导文件属于另一条分支或会话，已拒绝', '请用户在本机重新连接')
+    demand_repository(c)
     print('OK: 引导文件已校验 (sha256=%s) → TOOLS_DIR=%s' % (digest[:16], out), flush=True)
     print('OK: repository=%s branch=%s binding=%s' % (c.get('repository'), c.get('branch'), c.get('binding')), flush=True)
     return out
@@ -541,7 +751,7 @@ def api_wait_bootstrap(branch, ignore, since):
         if waited - last_hint >= 180:
             hint = '  ← 若本机没有反应：请用户在本地协作端 点 GitHub 徽章 →「连接 Agent」'
             last_hint = waited
-        print('waiting for desktop confirmation... %ds%s' % (waited, hint), flush=True)
+        print('waiting for desktop session bootstrap... %ds%s' % (waited, hint), flush=True)
         time.sleep(delay)
         delay = min(delay + 2, 15)
     stop('15 分钟内用户本地的协作端 没有发布接入资料', '请用户在电脑端 lebox 点 GitHub 徽章 →「连接 Agent」，然后让 Agent 重新运行 join')
@@ -566,6 +776,7 @@ def api_unpack(branch, tip, path):
     c = json.loads((out / 'connection.json').read_bytes())
     if c.get('branch') != branch or not path.endswith('/session-%s/bootstrap.json' % c.get('binding')):
         stop('引导文件属于另一条分支或会话，已拒绝', '请用户在本机重新连接')
+    demand_repository(c)
     print('OK: 引导文件已校验 (sha256=%s) → TOOLS_DIR=%s' % (digest[:16], out), flush=True)
     print('OK: repository=%s branch=%s binding=%s' % (c.get('repository'), c.get('branch'), c.get('binding')), flush=True)
     return out
@@ -606,8 +817,12 @@ def join():
     if API_MODE:
         tip = api_branch_tip(branch)
         ignore = api_bootstrap_files(tip) if tip else []
-        api_push_join(branch)
-        tip, path = api_wait_bootstrap(branch, ignore, int(time.time()))
+        if resume_existing(branch, ignore, tip):
+            return
+        path = preissued_bootstrap(branch, ignore, lambda p: api_blob(tip, p), lambda p: api_file_exists(tip, p))
+        if path is None:
+            api_push_join(branch)
+            tip, path = api_wait_bootstrap(branch, ignore, int(time.time()))
         tools = api_unpack(branch, tip, path)
         os.environ['LEBOX_TRANSPORT'] = 'api'  # agent_collaboration.py inherits: no git needed
         os.environ[TOKEN_ENV] = API_TOKEN
@@ -627,9 +842,13 @@ def join():
         return
     remote_exists = fetch_branch(branch, missing_ok=True)
     ignore = bootstrap_files('FETCH_HEAD') if remote_exists else []
-    since = int(time.time())
-    push_join(branch, remote_exists)
-    path = wait_bootstrap(branch, ignore, since)
+    if resume_existing(branch, ignore):
+        return
+    path = preissued_bootstrap(branch, ignore, lambda p: git('show', 'FETCH_HEAD:' + p, text=False), git_file_exists)
+    if path is None:
+        since = int(time.time())
+        push_join(branch, remote_exists)
+        path = wait_bootstrap(branch, ignore, since)
     tools = unpack(branch, path)
     ensure_dependency(tools)
     if AUTH_SOURCE in ('pasted-token', 'device-flow'):
@@ -664,6 +883,7 @@ def self_check():
 
 
 def main():
+    global JOIN_SUBJECT, PROJECT_ID
     self_check()
     global BRANCH_OVERRIDE
     args = sys.argv[1:]
@@ -693,6 +913,18 @@ def main():
             stop('--branch 需要一个分支名', '例如 --branch agent/codex-0922')
         BRANCH_OVERRIDE = args[i + 1].strip()
         del args[i:i + 2]
+    if '--project-route' in args:
+        i = args.index('--project-route')
+        if i + 1 >= len(args) or not re.fullmatch(r'[0-9a-f]{32}', args[i+1]):
+            stop('项目接入标识无效', '请重新复制当前项目的连接说明')
+        JOIN_SUBJECT += ' project=' + args[i+1]
+        del args[i:i+2]
+    if '--project-id' in args:
+        i = args.index('--project-id')
+        if i + 1 >= len(args) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', args[i+1]):
+            stop('项目标识无效', '请重新复制当前项目的说明')
+        PROJECT_ID = args[i+1]
+        del args[i:i+2]
     cmd = args[0] if args else 'join'
     if cmd == 'doctor':
         doctor(verbose=True)
