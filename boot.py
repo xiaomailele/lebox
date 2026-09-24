@@ -208,6 +208,8 @@ def fetch_agent(tools_repo, sha, token):
 
 def main():
     p = argparse.ArgumentParser(description='lebox bootstrap: authorize (if needed), verify and start agent.py join')
+    p.add_argument('--project-id', default='', help='expected project identity')
+    p.add_argument('--project-route', default='', help='project routing hint, not an access grant')
     p.add_argument('--repo', required=True, help='private collaboration repository owner/name')
     p.add_argument('--tools', default='', help='public tools repository owner/name (default: <owner>/lebox)')
     p.add_argument('--client-id', default='', help='GitHub App public client id (needed only when the sandbox has no GitHub access)')
@@ -241,7 +243,7 @@ def main():
     if token:
         env['LEBOX_TOKEN'] = token
     print('--- agent.py join ---', flush=True)
-    sys.exit(subprocess.run([sys.executable, 'agent.py', 'join', '--repo', a.repo], env=env).returncode)
+    sys.exit(subprocess.run([sys.executable, 'agent.py', 'join', '--repo', a.repo] + (['--project-route', a.project_route] if a.project_route else []) + (['--project-id', a.project_id] if a.project_id else []), env=env).returncode)
 
 
 if __name__ == '__main__':
